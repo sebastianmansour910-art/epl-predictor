@@ -45,6 +45,8 @@ FIRST = 1993
 FD = "https://football-data.co.uk/mmz4281/{code}/{div}.csv"
 FIXTURES = "https://football-data.co.uk/fixtures.csv"
 UNDERSTAT = "https://understat.com/getLeagueData/EPL/{y}"
+# Player data for UCL props: Understat's other leagues, keyed to the ESPN league of the same clubs
+UNDERSTAT_LEAGUES = {"EPL": "eng.1", "La_liga": "esp.1", "Bundesliga": "ger.1", "Serie_A": "ita.1", "Ligue_1": "fra.1"}
 ODDS_API = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds?apiKey={key}&regions=au&markets=h2h,totals&oddsFormat=decimal"
 
 # Every spelling seen in Understat / The Odds API -> the football-data name.
@@ -99,6 +101,8 @@ def fetch():
     jobs += [(DATA / f"E1_{y}.csv", FD.format(code=code(y), div="E1"), None) for y in range(2014, CURRENT + 1)]
     jobs += [(DATA / f"understat_{y}.json", UNDERSTAT.format(y=y), {"X-Requested-With": "XMLHttpRequest"})
              for y in range(2014, CURRENT + 1)]
+    jobs += [(understat_path(lg, y), UNDERSTAT.replace("EPL", lg).format(y=y), {"X-Requested-With": "XMLHttpRequest"})
+             for lg in UNDERSTAT_LEAGUES if lg != "EPL" for y in (CURRENT - 1, CURRENT)]
     jobs += [(DATA / "fixtures.csv", FIXTURES, None)]
     for path, url, headers in jobs:
         if path.exists() and not any(str(y) in path.name for y in (CURRENT, CURRENT - 1)) and path.name != "fixtures.csv":
@@ -141,8 +145,21 @@ def load_fd(div, years):
     return df.rename(columns={"HomeTeam": "home", "AwayTeam": "away"})
 
 
-def load_understat(y):
-    return json.loads((DATA / f"understat_{y}.json").read_text())
+def understat_path(league, y):
+    return DATA / (f"understat_{y}.json" if league == "EPL" else f"understat_{league}_{y}.json")
+
+
+def load_understat(y, league="EPL"):
+    return json.loads(understat_path(league, y).read_text())
+
+
+def understat_team_xg(league="EPL", y=None):
+    """Team -> xG per game this season, from Understat's match history."""
+    y = CURRENT if y is None else y
+    if not understat_path(league, y).exists():
+        return {}
+    return {canon(t["title"]): float(np.mean([h["xG"] for h in t["history"]]))
+            for t in load_understat(y, league)["teams"].values() if t["history"]}
 
 
 def understat_matches(years):
@@ -607,7 +624,8 @@ def pick_bets(o, probs, fair):
             label = {"H": h, "A": a, "D": "Draw", "O2.5": "Over 2.5", "U2.5": "Under 2.5"}[sel]
             rows.append(dict(fixture=f"{h} v {a}", bet=label, book=best.book, odds=best.price, model=pm, market=pf,
                              blend=pb, ev=pb * best.eff - 1, soft_line=pf * best.eff > 1, stake=kelly(pb, best.eff)))
-    return pd.DataFrame(rows).sort_values("ev", ascending=False, ignore_index=True)
+    cols = ["fixture", "bet", "book", "odds", "model", "market", "blend", "ev", "soft_line", "stake"]
+    return pd.DataFrame(rows, columns=cols).sort_values("ev", ascending=False, ignore_index=True)
 
 
 def value_bets(m=None):
@@ -641,6 +659,7 @@ def value():
 
 PROPS_API = ("https://api.the-odds-api.com/v4/sports/soccer_epl/events{path}?apiKey={key}"
              "&regions=au&markets=player_goal_scorer_anytime,player_assists,player_shots&oddsFormat=decimal")
+PROPS_API_UCL = PROPS_API.replace("soccer_epl", "soccer_uefa_champs_league")
 PROPS_DIR, LEDGER = DATA / "props", DATA / "props_ledger.csv"
 PROP_MARKETS = {"player_goal_scorer_anytime": "Anytime scorer", "player_assists": "Assist", "player_shots": "Shots"}
 PROPS_EV_MIN = 0.10  # untested model and big margins: demand more than the match markets
@@ -672,17 +691,20 @@ def match_player(name, cands):
     return by[close[0]] if len(close) == 1 else None
 
 
-def player_table():
-    """One row per current-season player: shrunk per-90 rates for xG, xA and shots, minutes per appearance."""
-    def load(y):
-        if not (DATA / f"understat_{y}.json").exists():
-            return pd.DataFrame(columns=["id", "time", "games", "xG", "xA", "shots"])
-        df = pd.DataFrame(load_understat(y)["players"])
+@cache
+def player_table(leagues=("EPL",)):
+    """One row per current-season player in `leagues`: shrunk per-90 rates for xG, xA and shots, minutes per
+    appearance. Last season counts from any of the five Understat leagues, so a summer signing keeps his record."""
+    def load(y, lg):
+        if not understat_path(lg, y).exists():
+            return pd.DataFrame(columns=["id", "time", "games", "goals", "assists", "xG", "xA", "shots", "league"])
+        df = pd.DataFrame(load_understat(y, lg)["players"]).assign(league=lg)
         for c in ("time", "games", "goals", "assists", "xG", "xA", "shots"):
             df[c] = pd.to_numeric(df[c])
         return df
-    cur, last = load(CURRENT), load(CURRENT - 1)
-    df = cur.merge(last[["id", "time", "xG", "xA", "shots"]], on="id", how="left", suffixes=("", "_l")).fillna(
+    cur = pd.concat([load(CURRENT, lg) for lg in leagues]).drop_duplicates("id", keep="last")
+    last = pd.concat([load(CURRENT - 1, lg) for lg in UNDERSTAT_LEAGUES]).groupby("id")[["time", "xG", "xA", "shots"]].sum()
+    df = cur.merge(last.reset_index(), on="id", how="left", suffixes=("", "_l")).fillna(
         {"time_l": 0, "xG_l": 0, "xA_l": 0, "shots_l": 0})
     # ponytail: last season counts at half weight whatever club it was at; a role change shows up slowly
     mins = df.time + LAST_SEASON_W * df.time_l
@@ -703,7 +725,8 @@ def player_probs(pl, team, team_xg, team_xg_pg):
     (AU books void anytime-scorer and shots bets on non-runners)."""
     from scipy.stats import poisson
     d = pl[pl.teams.map(lambda ts: team in ts)].copy()
-    ratio = float(np.clip(team_xg / team_xg_pg, 0.5, 2))  # this match vs the team's season average
+    # this match vs the team's season average; Bayern at 3.8 xG a game at home in the league can drop to 1.3 v Arsenal
+    ratio = float(np.clip(team_xg / team_xg_pg, 0.25, 2.5))
     share = ratio * d.min_app / 90
     d["p_goal"] = 1 - np.exp(-d.g90 * share)
     d["p_assist"] = 1 - np.exp(-d.a90 * share)
@@ -714,42 +737,98 @@ def player_probs(pl, team, team_xg, team_xg_pg):
     return d
 
 
-def fetch_props(fx):
-    """Player-prop odds for each upcoming fixture, fetched once per event (about 3 credits each)."""
+def props_events(api):
+    """Upcoming events for an Odds API sport (free), or [] with a message if unavailable."""
     key = os.environ.get("ODDS_API_KEY")
     if not key:
         print("props needs ODDS_API_KEY; pricing only the props already fetched")
-        return
-    PROPS_DIR.mkdir(exist_ok=True)
+        return []
     try:
-        events = json.loads(get(PROPS_API.format(path="", key=key).split("&regions")[0]))  # event list is free
+        return json.loads(get(api.format(path="", key=key).split("&regions")[0]))
     except urllib.error.HTTPError as e:
         print(f"The Odds API refused the props event list (HTTP {e.code}); pricing only the props already fetched")
-        return
     except (OSError, http.client.HTTPException) as e:
         print(f"The Odds API refused the props event list (unreachable: {e!r}); pricing only the props already fetched")
+    return []
+
+
+def fetch_event_props(api, ev):
+    """One event's player-prop odds into data/props/, once books have posted them (1 credit per market offered)."""
+    PROPS_DIR.mkdir(exist_ok=True)
+    if (PROPS_DIR / f"{ev['id']}.json").exists():
         return
-    want = set(zip(fx.home, fx.away))
-    for ev in events:
-        if (canon(ev["home_team"]), canon(ev["away_team"])) not in want or (PROPS_DIR / f"{ev['id']}.json").exists():
-            continue
-        try:
-            body, hdr = fetch_url(PROPS_API.format(path=f"/{ev['id']}/odds", key=key))
-            (PROPS_DIR / f"{ev['id']}.json").write_bytes(body)
-            print(f"fetched props for {ev['home_team']} v {ev['away_team']}, credits left:",
-                  hdr.get("x-requests-remaining"))
-        except urllib.error.HTTPError as e:
-            print(f"The Odds API refused the props request (HTTP {e.code}) for {ev['home_team']} v {ev['away_team']}")
-        except (OSError, http.client.HTTPException) as e:
-            print(f"The Odds API refused the props request (unreachable: {e!r}) for {ev['home_team']} v {ev['away_team']}")
+    try:
+        body, hdr = fetch_url(api.format(path=f"/{ev['id']}/odds", key=os.environ["ODDS_API_KEY"]))
+        if not json.loads(body).get("bookmakers"):
+            return  # nothing posted yet (free); ask again next run instead of caching the empty answer
+        (PROPS_DIR / f"{ev['id']}.json").write_bytes(body)
+        print(f"fetched props for {ev['home_team']} v {ev['away_team']}, credits left:", hdr.get("x-requests-remaining"))
+    except urllib.error.HTTPError as e:
+        print(f"The Odds API refused the props request (HTTP {e.code}) for {ev['home_team']} v {ev['away_team']}")
+    except (OSError, http.client.HTTPException) as e:
+        print(f"The Odds API refused the props request (unreachable: {e!r}) for {ev['home_team']} v {ev['away_team']}")
 
 
-def prop_rows(m=None):
-    """Every priced prop for the next round: model chance, best AU price, market median implied chance."""
-    m = m or fit(matches(), TODAY + pd.Timedelta(days=1))
+def load_event_props(ev_id):
+    p = PROPS_DIR / f"{ev_id}.json"
+    return json.loads(p.read_text()) if p.exists() else None
+
+
+def price_event(ev, sides, comp, espn_id=None):
+    """Rows for every priced prop in one event. sides: (home label, away label) -> player_probs frames."""
+    (home, away), frames = list(sides), list(sides.values())
+    both = pd.concat([f.assign(side=lbl) for lbl, f in zip((home, away), frames)])
+    both = both[~both.index.duplicated()]
+    cands = both.player_name.to_dict()
+    prices = [(b["title"], mk["key"], o["description"], o.get("point", 0.5), float(o["price"]))
+              for b in ev["bookmakers"] if b["title"] not in EXCHANGES  # exchange props are empty 1.01 shells
+              for mk in b["markets"] if mk["key"] in PROP_MARKETS
+              for o in mk["outcomes"] if o["name"] in ("Yes", "Over") and o.get("description") != "No Scorer"]
+    o = pd.DataFrame(prices, columns=["book", "market", "name", "line", "price"])
+    o["pid"] = o.name.map(lambda n: match_player(n, cands))
+    rows = []
+    for (pid, mk, line), d in o.dropna(subset=["pid"]).groupby(["pid", "market", "line"]):
+        r = both.loc[pid]
+        p = r.p_goal if mk == "player_goal_scorer_anytime" else r.p_assist if mk == "player_assists" else r.shots_over(line)
+        best = d.loc[d.price.idxmax()]
+        rows.append(dict(comp=comp, espn_id=espn_id, event_id=ev["id"], kickoff=pd.Timestamp(ev["commence_time"]).tz_convert(None),
+                         home=home, away=away, team=r.side, pid=pid, player=r.player_name, market=mk, line=line,
+                         book=best.book, odds=best.price, books=len(d), model=p,
+                         market_imp=(1 / d.price).median() if len(d) > 1 else np.nan, ev=p * best.price - 1,
+                         base_games=r.games, base_goals=r.goals, base_assists=r.assists, base_shots=r.shots))
+    fair = both.assign(comp=comp, match=f"{home} v {away}", team=both.side)
+    return rows, fair
+
+
+ESPN_TO_UNDERSTAT = {"Internazionale": "Inter", "Paris Saint-Germain": "Paris Saint Germain", "RB Leipzig": "RasenBallsport Leipzig"}
+
+
+def understat_team(name, slug):
+    """Understat team (canon) for an ESPN club in a top-five league, or None."""
+    import difflib
+    lg = next((k for k, v in UNDERSTAT_LEAGUES.items() if v == slug), None)
+    if lg is None or not understat_path(lg, CURRENT).exists():
+        return None
+    titles = list(understat_team_xg(lg))
+    name = canon(ESPN_TO_UNDERSTAT.get(name, name))  # EPL titles are stored in football-data form ("Man City")
+    keys = {_team_key(t): t for t in titles}
+    k = _team_key(name)
+    if k in keys:
+        return keys[k]
+    hits = [t for kk, t in keys.items() if set(k.split()) <= set(kk.split()) or set(kk.split()) <= set(k.split())]
+    if len(hits) == 1:  # "Marseille" / "Olympique Marseille"
+        return hits[0]
+    close = difflib.get_close_matches(k, list(keys), n=2, cutoff=0.75)
+    return keys[close[0]] if len(close) == 1 else None
+
+
+def epl_prop_rows(m):
     fx = upcoming()
-    fetch_props(fx)
-    pl, prof = player_table(), team_profiles()
+    want = set(zip(fx.home, fx.away))
+    for ev in props_events(PROPS_API):
+        if (canon(ev["home_team"]), canon(ev["away_team"])) in want:
+            fetch_event_props(PROPS_API, ev)
+    pl, txg = player_table(), understat_team_xg()
     rows, fair = [], []
     evs = [json.loads(p.read_text()) for p in PROPS_DIR.glob("*.json")]
     for f in fx.itertuples():
@@ -758,30 +837,56 @@ def prop_rows(m=None):
         if ev is None:
             continue
         lam, mu = rates(m, f.home, f.away)
-        side = {t: player_probs(pl, t, x, prof.xg[t]) for t, x in ((f.home, lam), (f.away, mu))}
-        both = pd.concat(side.values())
-        both = both[~both.index.duplicated()]
-        fair.append(both.assign(match=f"{f.home} v {f.away}", team=[next(t for t in (f.home, f.away) if t in ts) for ts in both.teams]))
-        cands = both.player_name.to_dict()
-        prices = [(b["title"], mk["key"], o["description"], o.get("point", 0.5), float(o["price"]))
-                  for b in ev["bookmakers"] if b["title"] not in EXCHANGES  # exchange props are empty 1.01 shells
-                  for mk in b["markets"] if mk["key"] in PROP_MARKETS
-                  for o in mk["outcomes"] if o["name"] in ("Yes", "Over") and o.get("description") != "No Scorer"]
-        o = pd.DataFrame(prices, columns=["book", "market", "name", "line", "price"])
-        o["pid"] = o.name.map(lambda n: match_player(n, cands))
-        for (pid, mk, line), d in o.dropna(subset=["pid"]).groupby(["pid", "market", "line"]):
-            r = both.loc[pid]
-            team = next(t for t in (f.home, f.away) if t in r.teams)
-            p = r.p_goal if mk == "player_goal_scorer_anytime" else r.p_assist if mk == "player_assists" else r.shots_over(line)
-            best = d.loc[d.price.idxmax()]
-            rows.append(dict(event_id=ev["id"], kickoff=pd.Timestamp(ev["commence_time"]).tz_convert(None),
-                             home=f.home, away=f.away, team=team, pid=pid, player=r.player_name, market=mk, line=line,
-                             book=best.book, odds=best.price, books=len(d), model=p,
-                             market_imp=(1 / d.price).median() if len(d) > 1 else np.nan, ev=p * best.price - 1,
-                             base_games=r.games, base_goals=r.goals, base_assists=r.assists, base_shots=r.shots))
+        r, fp = price_event(ev, {f.home: player_probs(pl, f.home, lam, txg[f.home]),
+                                 f.away: player_probs(pl, f.away, mu, txg[f.away])}, "EPL")
+        rows += r; fair.append(fp)
+    return rows, fair
+
+
+def ucl_prop_rows(em):
+    """Props for the next UCL matchday, sides from the five Understat leagues only (their domestic per-90 rates,
+    scaled to this match's expected goals from the cross-league model). Other clubs' players aren't priced."""
+    fx = ucl_upcoming()
+    if fx.empty:
+        return [], []
+    tl = team_leagues(euro_matches())
+    us = {t: understat_team(n, tl.get(t)) for t, n in pd.concat([fx[["home_id", "home"]].set_axis(["id", "n"], axis=1),
+                                                                  fx[["away_id", "away"]].set_axis(["id", "n"], axis=1)]).values}
+    events = props_events(PROPS_API_UCL) if fx.date.min() <= NOW_UTC + pd.Timedelta(days=4) else []
+    by_fx = {}
+    for ev in events:
+        if (f := match_fixture(ev, fx)) is not None and (us.get(f.home_id) or us.get(f.away_id)):
+            by_fx[f.id] = ev
+            fetch_event_props(PROPS_API_UCL, ev)
+    pl = player_table(tuple(UNDERSTAT_LEAGUES))
+    txg = {t: x for lg in UNDERSTAT_LEAGUES for t, x in understat_team_xg(lg).items()}
+    rows, fair = [], []
+    for f in fx.itertuples():
+        ev = load_event_props(by_fx[f.id]["id"]) if f.id in by_fx else None
+        if ev is None:
+            continue
+        lam, mu = euro_rates(em, f.home_id, f.away_id, f.neutral)
+        empty = pl.iloc[:0].assign(p_goal=[], p_assist=[], exp_shots=[], shots_over=[])
+        sides = {}
+        for lbl, tid, x in ((f.home, f.home_id, lam), (f.away, f.away_id, mu)):
+            t = us.get(tid)
+            sides[lbl] = player_probs(pl, t, x, txg[t]) if t else empty
+        r, fp = price_event(ev, sides, "UCL", espn_id=f.id)
+        rows += r; fair.append(fp)
+    return rows, fair
+
+
+def prop_rows(m=None, em=None):
+    """Every priced prop for the next EPL round and UCL matchday: model chance, best AU price, market median."""
+    m = m or fit(matches(), TODAY + pd.Timedelta(days=1))
+    em = em or fit_euro(euro_matches(), TODAY + pd.Timedelta(days=1))
+    rows, fair = epl_prop_rows(m)
+    r2, f2 = ucl_prop_rows(em)
+    rows, fair = rows + r2, fair + f2
     if fair:  # model prices for everyone, incl. assists, which no AU book offers
         fp = pd.concat(fair).sort_values("p_goal", ascending=False).groupby(["match", "team"], sort=False).head(4)
-        fp[["match", "team", "player_name", "min_app", "p_goal", "p_assist", "exp_shots"]].to_csv(DATA / "props_model.csv", index=False)
+        fp[["comp", "match", "team", "player_name", "min_app", "p_goal", "p_assist", "exp_shots"]].to_csv(
+            DATA / "props_model.csv", index=False)
     return pd.DataFrame(rows)
 
 
@@ -795,12 +900,57 @@ def picks(df):
     return df[(df.ev > PROPS_EV_MIN) & (df.odds <= PROPS_MAX_ODDS) & (gap <= PROPS_MAX_GAP) & (df.books >= 2)].copy()
 
 
+def espn_box(event_id, slug="uefa.champions"):
+    """Player name -> (appeared, goals, assists, shots) from ESPN's match summary; None until it's final."""
+    d = json.loads(get(f"https://site.api.espn.com/apis/site/v2/sports/soccer/{slug}/summary?event={event_id}"))
+    if not d.get("header", {}).get("competitions", [{}])[0].get("status", {}).get("type", {}).get("completed"):
+        return None
+    out = {}
+    for team in d.get("rosters", []):
+        for p in team.get("roster", []):
+            st = {x["name"]: x.get("value") or 0 for x in p.get("stats", [])}
+            out[p["athlete"]["displayName"]] = (bool(p.get("starter") or p.get("subbedIn")),
+                                                int(st.get("totalGoals", 0)), int(st.get("goalAssists", 0)),
+                                                int(st.get("totalShots", 0)))
+    return out
+
+
+def grade(r, got):
+    won = got > (0.5 if r.market != "player_shots" else r.line)
+    return ("win", r.stake * (r.odds - 1)) if won else ("loss", -r.stake)
+
+
+def settle_ucl(ledger):
+    """UCL props: grade from ESPN's box score (domestic Understat totals don't move in Europe)."""
+    todo = ledger[ledger.result.isna() & (ledger.comp == "UCL")
+                  & (pd.to_datetime(ledger.kickoff) < NOW_UTC - pd.Timedelta(hours=3))]
+    for eid, grp in todo.groupby("espn_id"):
+        try:
+            box = espn_box(str(int(float(eid))))
+        except (OSError, http.client.HTTPException, json.JSONDecodeError):
+            continue  # try again next run
+        if box is None:
+            continue
+        names = dict(enumerate(box))
+        for i, r in grp.iterrows():
+            k = match_player(r.player, names)
+            appeared, goals, assists, shots = box[names[k]] if k is not None else (False, 0, 0, 0)
+            if not appeared:
+                ledger.loc[i, ["result", "pnl"]] = "void", 0.0  # not in the squad or unused sub
+                continue
+            got = {"player_goal_scorer_anytime": goals, "player_assists": assists, "player_shots": shots}[r.market]
+            ledger.loc[i, ["result", "pnl"]] = grade(r, got)
+    return ledger
+
+
 def settle(ledger):
-    """Grade paper bets from the change in each player's Understat season totals across the match."""
+    """Grade EPL paper bets from the change in each player's Understat season totals across the match,
+    UCL ones from ESPN's box score."""
     pl = pd.DataFrame(load_understat(CURRENT)["players"]).set_index("id")
     us = understat_matches([CURRENT])
     ledger["result"] = ledger.result.astype(object)
-    for i, r in ledger[ledger.result.isna()].iterrows():
+    ledger = settle_ucl(ledger)
+    for i, r in ledger[ledger.result.isna() & (ledger.comp == "EPL")].iterrows():
         logged, ko = pd.Timestamp(r.logged), pd.Timestamp(r.kickoff)
         fx = us[(us.home == r.home) & (us.away == r.away) & (us.kickoff.dt.date == ko.date())]
         if fx.empty or not fx.played.iat[0]:
@@ -815,15 +965,15 @@ def settle(ledger):
             continue
         got = {"player_goal_scorer_anytime": int(p.goals) - r.base_goals, "player_assists": int(p.assists) - r.base_assists,
                "player_shots": int(p.shots) - r.base_shots}[r.market]
-        won = got > (0.5 if r.market != "player_shots" else r.line)
-        ledger.loc[i, ["result", "pnl"]] = ("win", r.stake * (r.odds - 1)) if won else ("loss", -r.stake)
+        ledger.loc[i, ["result", "pnl"]] = grade(r, got)
     return ledger
 
 
 def update_ledger(df):
-    cols = ["logged", "event_id", "kickoff", "home", "away", "team", "pid", "player", "market", "line", "book", "odds",
+    cols = ["logged", "comp", "espn_id", "event_id", "kickoff", "home", "away", "team", "pid", "player", "market", "line", "book", "odds",
             "model", "market_imp", "ev", "stake", "base_games", "base_goals", "base_assists", "base_shots", "result", "pnl"]
     led = pd.read_csv(LEDGER, dtype={"pid": str}) if LEDGER.exists() else pd.DataFrame(columns=cols)
+    led = led.reindex(columns=cols).fillna({"comp": "EPL"})  # ledgers from before UCL props have no comp column
     new = picks(df).assign(logged=NOW_UTC, stake=lambda d: [kelly(p, o) for p, o in zip(d.model, d.odds)],
                            result=np.nan, pnl=np.nan)
     seen = set(zip(led.event_id, led.pid.astype(str), led.market, led.line))
@@ -833,8 +983,8 @@ def update_ledger(df):
     return led, len(new)
 
 
-def ledger_summary(led):
-    done = led[led.result.isin(["win", "loss"])]
+def ledger_summary(led, comp=None):
+    done = led[led.result.isin(["win", "loss"]) & ((led.comp == comp) if comp else True)]
     if done.empty:
         return "no paper bets settled yet"
     exp = (done.model * done.stake * done.odds - done.stake).sum()
@@ -857,12 +1007,13 @@ def props():
     if pk.empty:
         print("No paper picks this round.")
     else:
-        out = pd.DataFrame({"match": pk.home + " v " + pk.away, "player": pk.player, "bet": pk.apply(prop_label, axis=1),
+        out = pd.DataFrame({"comp": pk.comp, "match": pk.home + " v " + pk.away, "player": pk.player,
+                            "bet": pk.apply(prop_label, axis=1),
                             "book": pk.book, "odds": pk.odds, "model": pk.model.map("{:.1%}".format),
                             "market": pk.market_imp.map(lambda v: "" if pd.isna(v) else f"{v:.1%}"),
                             "ev": pk.ev.map("{:+.1%}".format)})
         print(out.to_string(index=False))
-    print(f"\nlogged {n_new} new paper bets; {ledger_summary(led)}")
+    print(f"\nlogged {n_new} new paper bets; EPL {ledger_summary(led, 'EPL')}; UCL {ledger_summary(led, 'UCL')}")
     print("Chances assume the player appears (non-runners are void). Check lineups: a benched starter halves these.")
     return df
 
@@ -1325,9 +1476,36 @@ tr:last-child td{border-bottom:0}
 .chart h3{font-size:14px;margin:0 0 8px;font-weight:600}.chart .box{position:relative;height:240px}
 details summary{cursor:pointer;color:var(--ink2);margin-top:12px}
 .empty{color:var(--ink2)}
+.tabs{display:flex;gap:4px;margin:20px 0 4px;border-bottom:1px solid var(--axis)}
+.tabs button{font:600 15px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink2);background:none;border:0;
+border-bottom:2px solid transparent;margin-bottom:-1px;padding:10px 14px;cursor:pointer;border-radius:8px 8px 0 0}
+.tabs button:hover{color:var(--ink);background:var(--surface)}
+.tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1)}
+.tabs button:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
+section[role="tabpanel"] > h2:first-of-type{margin-top:24px}
 """
 
 REPORT_JS = """
+const tabs = [...document.querySelectorAll('[role="tab"]')];
+function show(id, focus) {
+  for (const t of tabs) {
+    const on = t.id === id;
+    t.setAttribute('aria-selected', on); t.tabIndex = on ? 0 : -1;
+    document.getElementById(t.getAttribute('aria-controls')).hidden = !on;
+    if (on && focus) t.focus();
+  }
+  try { localStorage.setItem('tab', id); } catch (e) {}
+}
+tabs.forEach((t, i) => {
+  t.addEventListener('click', () => { show(t.id); history.replaceState(null, '', '#' + t.id.slice(2)); });
+  t.addEventListener('keydown', e => {
+    const d = {ArrowRight: 1, ArrowLeft: -1}[e.key];
+    if (d) { e.preventDefault(); show(tabs[(i + d + tabs.length) % tabs.length].id, true); }
+  });
+});
+let start = 't-' + location.hash.slice(1);
+if (!document.getElementById(start)) { try { start = localStorage.getItem('tab'); } catch (e) { start = null; } }
+if (start && document.getElementById(start)) show(start);
 const T = JSON.parse(document.getElementById('trend-data').textContent);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const crosshair = {id: 'crosshair', afterDatasetsDraw(c) {
@@ -1379,6 +1557,39 @@ def html_table(df, wrap=()):
     return f'<div class="wrap"><table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>'
 
 
+def props_section(comp):
+    """Paper picks, record and model prices for one competition, as HTML."""
+    import html
+    if not (DATA / "props_latest.csv").exists():
+        return '<p class="empty">Run <code>uv run epl.py props</code> to fill this section.</p>'
+    pp = pd.read_csv(DATA / "props_latest.csv", parse_dates=["kickoff"])
+    pp = pp[(pp.comp if "comp" in pp else pd.Series("EPL", index=pp.index)) == comp]
+    pk = picks(pp[pp.kickoff > NOW_UTC]).sort_values("ev", ascending=False)
+    led = pd.read_csv(LEDGER) if LEDGER.exists() else pd.DataFrame(columns=["result"])
+    led = led.reindex(columns=[*led.columns, *(["comp"] if "comp" not in led else [])]).fillna({"comp": "EPL"})
+    pk = pd.DataFrame({"Match": pk.home + " v " + pk.away, "Player": pk.player,
+                       "Bet": pk.apply(prop_label, axis=1) if len(pk) else [], "Book": pk.book,
+                       "Odds": pk.odds.map("{:.2f}".format), "Model": pk.model.map("{:.1%}".format),
+                       "Market": pk.market_imp.map(lambda v: "–" if pd.isna(v) else f"{v:.1%}"),
+                       "EV": pk.ev.map("{:+.1%}".format)})
+    none = ("No paper picks this round." if len(pp) else
+            "No AU player prices yet. Books usually post them a day or two before kickoff.")
+    out = (f'<div class="card">{html_table(pk) if len(pk) else f"<p class=empty>{none}</p>"}</div>'
+           f'<p class="note">Paper record: {html.escape(ledger_summary(led, comp))}.</p>')
+    if (DATA / "props_model.csv").exists():
+        fp = pd.read_csv(DATA / "props_model.csv")
+        fp = fp[(fp.comp if "comp" in fp else pd.Series("EPL", index=fp.index)) == comp]
+        if len(fp):
+            fp = pd.DataFrame({"Match": fp.match, "Player": fp.player_name + " (" + fp.team + ")",
+                               "Mins/app": fp.min_app.round().astype(int),
+                               "Score": [f"{p:.0%} ({1 / p:.2f})" for p in fp.p_goal],
+                               "Assist": [f"{p:.0%} ({1 / p:.2f})" for p in fp.p_assist],
+                               "Exp. shots": fp.exp_shots.round(1)})
+            out += ('<details><summary>Model prices, top four scorers per side (fair odds in brackets; assists have no '
+                    f'AU market, compare these with any book)</summary><div class="card">{html_table(fp)}</div></details>')
+    return out
+
+
 @command
 def report():
     import html
@@ -1408,27 +1619,7 @@ def report():
                          "EV": bets.ev.map("{:+.1%}".format), "Soft line": bets.soft_line.map({True: "yes", False: ""}),
                          "Stake": bets.stake.map("{:.1%}".format)})
 
-    props_html = '<p class="empty">Run <code>uv run epl.py props</code> to fill this section.</p>'
-    if (DATA / "props_latest.csv").exists():
-        pp = pd.read_csv(DATA / "props_latest.csv", parse_dates=["kickoff"])
-        pk = picks(pp[pp.kickoff > NOW_UTC]).sort_values("ev", ascending=False)
-        led = pd.read_csv(LEDGER) if LEDGER.exists() else pd.DataFrame(columns=["result"])
-        pk = pd.DataFrame({"Match": pk.home + " v " + pk.away, "Player": pk.player,
-                           "Bet": pk.apply(prop_label, axis=1) if len(pk) else [], "Book": pk.book,
-                           "Odds": pk.odds.map("{:.2f}".format), "Model": pk.model.map("{:.1%}".format),
-                           "Market": pk.market_imp.map(lambda v: "–" if pd.isna(v) else f"{v:.1%}"),
-                           "EV": pk.ev.map("{:+.1%}".format)})
-        props_html = (f'<div class="card">{html_table(pk) if len(pk) else "<p class=empty>No paper picks this round.</p>"}</div>'
-                      f'<p class="note">Paper record: {html.escape(ledger_summary(led))}.</p>')
-        if (DATA / "props_model.csv").exists():
-            fp = pd.read_csv(DATA / "props_model.csv")
-            fp = pd.DataFrame({"Match": fp.match, "Player": fp.player_name + " (" + fp.team + ")",
-                               "Mins/app": fp.min_app.round().astype(int),
-                               "Score": [f"{p:.0%} ({1 / p:.2f})" for p in fp.p_goal],
-                               "Assist": [f"{p:.0%} ({1 / p:.2f})" for p in fp.p_assist],
-                               "Exp. shots": fp.exp_shots.round(1)})
-            props_html += ('<details><summary>Model prices, top four scorers per side (fair odds in brackets; assists have no '
-                           f'AU market, compare these with any book)</summary><div class="card">{html_table(fp)}</div></details>')
+    props_html = {c: props_section(c) for c in ("EPL", "UCL")}
     upr, uvb = ucl_predictions()
     if upr.empty:
         ucl_html = '<p class="empty">No Champions League fixtures scheduled.</p>'
@@ -1452,10 +1643,11 @@ def report():
                                "EV": ub.ev.map("{:+.1%}".format), "Soft line": ub.soft_line.map({True: "yes", False: ""}),
                                "Stake": ub.stake.map("{:.1%}".format)})
             ucl_html += f'<h3>Value bets</h3><div class="card">{html_table(ub)}</div>'
+    ucl_bt = '<p class="empty">Run <code>uv run epl.py ucl_backtest</code> to fill this section.</p>'
     if (DATA / "euro_backtest.json").exists():
         eb = json.loads((DATA / "euro_backtest.json").read_text())
         et = pd.DataFrame(eb["rows"], columns=["Model", "Log loss, all European", "Brier, all European", "Log loss, UCL"]).round(4)
-        ucl_html += (f'<p class="sub">Walk-forward over {eb["games"]:,} European games ({eb["ucl_games"]:,} in the UCL proper) '
+        ucl_bt = (f'<p class="sub">Walk-forward over {eb["games"]:,} European games ({eb["ucl_games"]:,} in the UCL proper) '
                      f'since {html.escape(eb["from"])}, refitting every two weeks. Lower is better. In use: {html.escape(eb["best"])}.</p>'
                      f'<div class="card">{html_table(et)}</div>')
     ss = simulate_season(m)
@@ -1497,13 +1689,21 @@ def report():
     charts = "".join(f'<div class="card chart"><h3>{html.escape(t)}</h3><div class="box"><canvas id="c{i}" role="img" '
                      f'aria-label="{html.escape(t)}, by season. Values are in the season table below."></canvas></div></div>'
                      for i, (t, _, _) in enumerate(TREND_CHARTS))
-    head = f"""<title>EPL Predictor</title><meta name="claude:viewport-fit-sides" content="cover">
+    head = f"""<title>Football Predictor</title><meta name="claude:viewport-fit-sides" content="cover">
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600&display=swap">
 <style>{REPORT_CSS}</style>"""
     body = f"""<main>
-<h1>EPL Predictor</h1>
-<p class="sub">Generated {datetime.now():%a %d %b %Y %H:%M}. Odds from {html.escape(src)}. Model: Dixon–Coles, time decay
-ξ={p['xi']}, xG weight {1 - p['alpha']:.0%}, blended {p['w']:.0%} model / {1 - p['w']:.0%} market for value bets.</p>
+<h1>Football Predictor</h1>
+<p class="sub">Generated {datetime.now():%a %d %b %Y %H:%M}. Odds from {html.escape(src)}.</p>
+
+<div class="tabs" role="tablist" aria-label="Competition">
+<button role="tab" id="t-epl" aria-controls="p-epl" aria-selected="true">Premier League</button>
+<button role="tab" id="t-ucl" aria-controls="p-ucl" aria-selected="false" tabindex="-1">Champions League</button>
+</div>
+
+<section role="tabpanel" id="p-epl" aria-labelledby="t-epl">
+<p class="sub">Dixon–Coles, time decay ξ={p['xi']}, xG weight {1 - p['alpha']:.0%}, blended {p['w']:.0%} model /
+{1 - p['w']:.0%} market for value bets.</p>
 
 <h2>Next round</h2>
 <p class="sub">Model probabilities against the de-vigged market. Kickoffs in local time.</p>
@@ -1515,19 +1715,12 @@ capped at {MAX_STAKE:.0%}. "Soft line" = the price beats the sharp market's fair
 <div class="card">{vb_note}{html_table(bets)}</div>
 <p class="note">A big model-vs-market gap usually means team news the model can't see. Check lineups first.</p>
 
-<h2>Champions League</h2>
-<p class="sub">Cross-league Dixon–Coles on goals from {len(DOMESTIC)} domestic leagues plus every European cup and qualifier since
-2019/20 (ESPN). A club's strength is its league's plus its own; European games put the leagues on one scale. Clubs from
-leagues ESPN doesn't carry (Czechia, Ukraine, Croatia, Azerbaijan...) are rated from European games alone. Value bets use the
-same {p['w']:.0%} model / {1 - p['w']:.0%} market blend as the EPL. That blend was tuned on EPL games, not European ones.</p>
-{ucl_html}
-
 <h2>Player props (paper bets)</h2>
 <p class="sub">Anytime scorer, assists and shots from each player's shrunk xG, xA and shots per 90, scaled to this match's
 expected goals. Picks need EV above {PROPS_EV_MIN:.0%} at the best AU price, odds up to {PROPS_MAX_ODDS}, and the model no more
 than {PROPS_MAX_GAP}× the market's chance. Logged, not staked, until the record says otherwise. Market = median implied chance
 across AU books, margin included.</p>
-{props_html}
+{props_html["EPL"]}
 <p class="note">Chances assume the player appears (books void non-runners). A benched starter roughly halves them: check lineups.</p>
 
 <h2>Season simulation</h2>
@@ -1549,6 +1742,28 @@ and after are not comparable. The current season is partial.</p>
 
 <h2>Backtest</h2>
 {bt_html}
+</section>
+
+<section role="tabpanel" id="p-ucl" aria-labelledby="t-ucl" hidden>
+<p class="sub">Cross-league Dixon–Coles on goals from {len(DOMESTIC)} domestic leagues plus every European cup and qualifier since
+2019/20 (ESPN). A club's strength is its league's plus its own; European games put the leagues on one scale. Clubs from
+leagues ESPN doesn't carry (Czechia, Ukraine, Croatia, Azerbaijan...) are rated from European games alone. Value bets use the
+same {p['w']:.0%} model / {1 - p['w']:.0%} market blend as the EPL. That blend was tuned on EPL games, not European ones.</p>
+
+<h2>Next matchday</h2>
+{ucl_html}
+
+<h2>Player props (paper bets)</h2>
+<p class="sub">Anytime scorer, assists and shots from each player's shrunk xG, xA and shots per 90 in their domestic league (Understat's five leagues; other clubs' players aren't priced), scaled to this match's
+expected goals. Picks need EV above {PROPS_EV_MIN:.0%} at the best AU price, odds up to {PROPS_MAX_ODDS}, and the model no more
+than {PROPS_MAX_GAP}× the market's chance. Logged, not staked, until the record says otherwise. Market = median implied chance
+across AU books, margin included.</p>
+{props_html["UCL"]}
+<p class="note">Chances assume the player appears (books void non-runners). A benched starter roughly halves them: check lineups.</p>
+
+<h2>Backtest</h2>
+{ucl_bt}
+</section>
 </main>
 <script type="application/json" id="trend-data">{trend_json}</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
