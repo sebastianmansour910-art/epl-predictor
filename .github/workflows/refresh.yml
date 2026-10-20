@@ -33,6 +33,7 @@ jobs:
         run: |
           uv run epl.py fetch
           uv run epl.py value
+          uv run epl.py --league laliga value
           uv run epl.py props
           uv run epl.py ucl
           uv run epl.py report

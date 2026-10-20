@@ -8,6 +8,7 @@ uv run epl.py fetch      download results, xG, fixtures and odds (run before the
 uv run epl.py predict    next round: probabilities, likely scores, team styles
 uv run epl.py value      bets whose best price beats the blended model/market probability
 uv run epl.py props      player props (anytime scorer, assists, shots) vs AU books, logged as paper bets
+uv run epl.py --league laliga value   any league command for La Liga (predict, value, season, tactics, backtest)
 uv run epl.py ucl        Champions League: cross-league model predictions and value bets
 uv run epl.py ucl_backtest  walk-forward test of the cross-league model on European games since 2023/24 (slow)
 uv run epl.py season     10,000 simulations of the rest of the season
@@ -49,6 +50,25 @@ UNDERSTAT = "https://understat.com/getLeagueData/EPL/{y}"
 UNDERSTAT_LEAGUES = {"EPL": "eng.1", "La_liga": "esp.1", "Bundesliga": "ger.1", "Serie_A": "ita.1", "Ligue_1": "fra.1"}
 ODDS_API = "https://api.the-odds-api.com/v4/sports/soccer_epl/odds?apiKey={key}&regions=au&markets=h2h,totals&oddsFormat=decimal"
 
+# Domestic leagues with the full pipeline: football-data top + second tier (promoted sides), Understat xG, AU odds.
+# `suffix` keeps each league's data files apart; the EPL keeps its original file names.
+LEAGUES = {
+    "EPL": dict(name="Premier League", fd="E0", fd2="E1", understat="EPL", odds="soccer_epl", suffix=""),
+    "LaLiga": dict(name="La Liga", fd="SP1", fd2="SP2", understat="La_liga", odds="soccer_spain_la_liga", suffix="_laliga"),
+}
+LG = {"key": "EPL", **LEAGUES["EPL"]}
+
+
+def set_league(key):
+    """Point every league-specific function at `key`. ponytail: one global, so leagues run one after another,
+    never concurrently; pass the league explicitly if this ever needs threads."""
+    LG.clear()
+    LG.update(key=key, **LEAGUES[key])
+
+
+def league_file(stem, ext="json"):
+    return DATA / f"{stem}{LG['suffix']}.{ext}"
+
 # Every spelling seen in Understat / The Odds API -> the football-data name.
 ALIASES = {
     "Manchester City": "Man City", "Manchester United": "Man United", "Newcastle United": "Newcastle",
@@ -59,6 +79,13 @@ ALIASES = {
     "Stoke City": "Stoke", "Swansea City": "Swansea", "Cardiff City": "Cardiff", "Hull City": "Hull",
     "Huddersfield Town": "Huddersfield", "Coventry City": "Coventry", "Queens Park Rangers": "QPR",
     "Sheffield Wednesday": "Sheffield Weds",
+    # La Liga: Understat / The Odds API -> football-data
+    "Athletic Club": "Ath Bilbao", "Athletic Bilbao": "Ath Bilbao", "Atletico Madrid": "Ath Madrid",
+    "Atlético Madrid": "Ath Madrid", "Celta Vigo": "Celta", "Deportivo La Coruna": "La Coruna",
+    "Deportivo La Coruña": "La Coruna", "Espanyol": "Espanol", "Racing Santander": "Santander",
+    "Real Racing Club de Santander": "Santander", "Rayo Vallecano": "Vallecano", "Real Betis": "Betis",
+    "Real Oviedo": "Oviedo", "Real Sociedad": "Sociedad", "Real Valladolid": "Valladolid", "SD Huesca": "Huesca",
+    "Sporting Gijon": "Sp Gijon", "Alavés": "Alaves", "CA Osasuna": "Osasuna", "Elche CF": "Elche", "Málaga": "Malaga",
 }
 
 
@@ -97,12 +124,13 @@ def get(url, headers=None):
 
 def fetch():
     DATA.mkdir(exist_ok=True)
-    jobs = [(DATA / f"E0_{y}.csv", FD.format(code=code(y), div="E0"), None) for y in range(FIRST, CURRENT + 1)]
-    jobs += [(DATA / f"E1_{y}.csv", FD.format(code=code(y), div="E1"), None) for y in range(2014, CURRENT + 1)]
-    jobs += [(DATA / f"understat_{y}.json", UNDERSTAT.format(y=y), {"X-Requested-With": "XMLHttpRequest"})
-             for y in range(2014, CURRENT + 1)]
+    jobs = [(DATA / f"E0_{y}.csv", FD.format(code=code(y), div="E0"), None) for y in range(FIRST, 2014)]  # EPL trends
+    for L in LEAGUES.values():
+        jobs += [(DATA / f"{div}_{y}.csv", FD.format(code=code(y), div=div), None)
+                 for div in (L["fd"], L["fd2"]) for y in range(2014, CURRENT + 1)]
+    full = {L["understat"] for L in LEAGUES.values()}  # xG history for the league models; last two seasons for props
     jobs += [(understat_path(lg, y), UNDERSTAT.replace("EPL", lg).format(y=y), {"X-Requested-With": "XMLHttpRequest"})
-             for lg in UNDERSTAT_LEAGUES if lg != "EPL" for y in (CURRENT - 1, CURRENT)]
+             for lg in UNDERSTAT_LEAGUES for y in (range(2014, CURRENT + 1) if lg in full else (CURRENT - 1, CURRENT))]
     jobs += [(DATA / "fixtures.csv", FIXTURES, None)]
     for path, url, headers in jobs:
         if path.exists() and not any(str(y) in path.name for y in (CURRENT, CURRENT - 1)) and path.name != "fixtures.csv":
@@ -114,21 +142,35 @@ def fetch():
             if not path.exists():
                 raise
             print(f"could not refresh {path.name} ({e!r}); kept the cached copy")
-    if key := os.environ.get("ODDS_API_KEY"):
-        api = DATA / "odds_api.json"
-        try:
-            body, hdr = fetch_url(ODDS_API.format(key=key))
-            api.write_bytes(body)
-            print("fetched odds_api.json, credits left:", hdr.get("x-requests-remaining"))
-        except urllib.error.HTTPError as e:
-            api.unlink(missing_ok=True)  # never price bets off an old snapshot
-            hint = " - check ODDS_API_KEY is your real key" if e.code == 401 else ""
-            print(f"The Odds API refused the request (HTTP {e.code}{hint}); using football-data.co.uk odds instead")
-        except (OSError, http.client.HTTPException) as e:
-            api.unlink(missing_ok=True)
-            print(f"The Odds API refused the request (unreachable: {e!r}); using football-data.co.uk odds instead")
+    for k in LEAGUES:
+        set_league(k)
+        fetch_league_odds()
+    set_league("EPL")
     fetch_espn()  # Champions League model: domestic leagues + European cups
     fetch_ucl_odds()
+
+
+def fetch_league_odds():
+    """1X2 + totals for the current league from The Odds API (2 credits), skipped when it has no game in 4 days."""
+    key = os.environ.get("ODDS_API_KEY")
+    api = league_file("odds_api")
+    if not key:
+        return
+    fx = understat_matches([CURRENT])
+    if fx.empty or not (~fx.played & fx.kickoff.between(NOW_UTC, NOW_UTC + pd.Timedelta(days=4))).any():
+        api.unlink(missing_ok=True)  # international break: save the credits
+        return
+    try:
+        body, hdr = fetch_url(ODDS_API.replace("soccer_epl", LG["odds"]).format(key=key))
+        api.write_bytes(body)
+        print(f"fetched {api.name}, credits left:", hdr.get("x-requests-remaining"))
+    except urllib.error.HTTPError as e:
+        api.unlink(missing_ok=True)  # never price bets off an old snapshot
+        hint = " - check ODDS_API_KEY is your real key" if e.code == 401 else ""
+        print(f"The Odds API refused the request (HTTP {e.code}{hint}); using football-data.co.uk odds instead")
+    except (OSError, http.client.HTTPException) as e:
+        api.unlink(missing_ok=True)
+        print(f"The Odds API refused the request (unreachable: {e!r}); using football-data.co.uk odds instead")
 
 
 def load_fd(div, years):
@@ -163,47 +205,48 @@ def understat_team_xg(league="EPL", y=None):
 
 
 def understat_matches(years):
-    """One row per fixture (played or not) with goals and xG."""
+    """One row per fixture of the current league (played or not) with goals and xG."""
     rows = []
     for y in years:
-        p = DATA / f"understat_{y}.json"
+        p = understat_path(LG["understat"], y)
         if not p.exists():
             continue
-        for m in load_understat(y)["dates"]:
+        for m in load_understat(y, LG["understat"])["dates"]:
             rows.append(dict(season=y, home=canon(m["h"]["title"]), away=canon(m["a"]["title"]),
                              played=m["isResult"], kickoff=pd.Timestamp(m["datetime"]),
                              hg=m["goals"]["h"], ag=m["goals"]["a"], xg_h=m["xG"]["h"], xg_a=m["xG"]["a"]))
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=["season", "home", "away", "played", "kickoff", "hg", "ag", "xg_h", "xg_a"])
     for c in ("hg", "ag", "xg_h", "xg_a"):
         df[c] = pd.to_numeric(df[c])
     return df
 
 
 @cache
-def e0_teams(y):
+def top_teams(y, div, understat):
     teams = set()
-    if (p := DATA / f"E0_{y}.csv").exists():
+    if (p := DATA / f"{div}_{y}.csv").exists():
         teams |= set(pd.read_csv(p, usecols=["HomeTeam"], encoding="utf-8-sig", encoding_errors="replace").HomeTeam.dropna())
-    if (DATA / f"understat_{y}.json").exists():
-        teams |= {canon(m["h"]["title"]) for m in load_understat(y)["dates"]}
+    if understat_path(understat, y).exists():
+        teams |= {canon(m["h"]["title"]) for m in load_understat(y, understat)["dates"]}
     return frozenset(teams)
 
 
 def matches(first=2014):
-    """E0 + E1 results since `first`, with Understat xG joined onto EPL games (by season + pairing)."""
-    df = pd.concat([load_fd("E0", range(first, CURRENT + 1)), load_fd("E1", range(first, CURRENT + 1))])
+    """Top + second tier results since `first`, with Understat xG joined onto top-flight games (season + pairing)."""
+    top, second = LG["fd"], LG["fd2"]
+    df = pd.concat([load_fd(top, range(first, CURRENT + 1)), load_fd(second, range(first, CURRENT + 1))])
     us = understat_matches(range(max(first, 2014), CURRENT + 1)).query("played")
     unknown = set(us.home) - set(df.home)
     assert not unknown, f"add these Understat names to ALIASES: {unknown}"
     df = df.merge(us[["season", "home", "away", "xg_h", "xg_a"]], on=["season", "home", "away"], how="left")
     # Understat posts results days before football-data does; add the ones football-data lacks.
     new = us.merge(df[["season", "home", "away"]], how="left", indicator=True).query("_merge == 'left_only'")
-    new = new.assign(date=new.kickoff.dt.normalize(), div="E0", hg=new.hg.astype(int), ag=new.ag.astype(int))
+    new = new.assign(date=new.kickoff.dt.normalize(), div=top, hg=new.hg.astype(int), ag=new.ag.astype(int))
     df = pd.concat([df, new.drop(columns=["_merge", "kickoff", "played"])]).sort_values("date", ignore_index=True)
-    # Championship games in a season that ended in promotion (see `_nll`)
-    up = {s: e0_teams(s + 1) for s in df.season.unique()}
+    # second-tier games in a season that ended in promotion (see `_nll`)
+    up = {s: top_teams(s + 1, top, LG["understat"]) for s in df.season.unique()}
     for side in ("home", "away"):
-        df[f"promo_{side}"] = [d == "E1" and t in up[s] for d, t, s in zip(df["div"], df[side], df.season)]
+        df[f"promo_{side}"] = [d == second and t in up[s] for d, t, s in zip(df["div"], df[side], df.season)]
     return df
 
 
@@ -216,7 +259,7 @@ E1_WEIGHT = 0.5  # Championship games count half as much as EPL games (backteste
 
 
 def params():
-    p = DATA / "params.json"
+    p = league_file("params")
     return {**PARAMS, **(json.loads(p.read_text()) if p.exists() else {})}
 
 
@@ -294,7 +337,7 @@ def fit(df, asof, xi=None, alpha=None, prev=None):
         ph, pa = (d.promo_home & known).to_numpy(float), (d.promo_away & known).to_numpy(float)
     w = np.exp(-xi * (asof - d.date).dt.days.to_numpy())
     if "div" in d:
-        w = w * np.where(d["div"] == "E1", E1_WEIGHT, 1)
+        w = w * np.where(d["div"] == LG["fd2"], E1_WEIGHT, 1)
     x0 = np.zeros(4 + 2 * n)
     x0[0] = 0.3
     if prev:
@@ -367,7 +410,7 @@ def pct(v):
 def team_profiles(y=CURRENT):
     """Per-team style and luck indicators for season `y` (Understat + football-data box scores)."""
     rows = []
-    for t in load_understat(y)["teams"].values():
+    for t in load_understat(y, LG["understat"])["teams"].values():
         h = pd.DataFrame(t["history"])
         att, dfn = sum(p["att"] for p in h.ppda), sum(p["def"] for p in h.ppda)
         o_att, o_def = sum(p["att"] for p in h.ppda_allowed), sum(p["def"] for p in h.ppda_allowed)
@@ -379,7 +422,7 @@ def team_profiles(y=CURRENT):
             g_minus_xg=h.scored.sum() - h.xG.sum(), ga_minus_xga=h.missed.sum() - h.xGA.sum(),
             form_xgd=(h.xG - h.xGA).tail(5).mean()))
     df = pd.DataFrame(rows).set_index("team")
-    fd = load_fd("E0", [y])
+    fd = load_fd(LG["fd"], [y])
     for c in ("HS", "AS", "HST", "AST", "HC", "AC", "HF", "AF", "HY", "AY", "HR", "AR"):
         fd[c] = pd.to_numeric(fd[c], errors="coerce")
     cols = ["shots", "shots_ag", "sot", "sot_ag", "corners", "fouls", "yellows", "reds"]
@@ -545,7 +588,7 @@ def season():
 def odds():
     """Long table of current prices: home, away, book, sel (H/D/A/O2.5/U2.5), price."""
     rows = []
-    api = DATA / "odds_api.json"
+    api = league_file("odds_api")
     if os.environ.get("ODDS_API_KEY") and api.exists():
         for ev in json.loads(api.read_text()):
             if pd.Timestamp(ev["commence_time"]).tz_convert(None) <= NOW_UTC:
@@ -562,7 +605,7 @@ def odds():
                             continue
                         rows.append(dict(home=h, away=a, book=b["title"], sel=sel, price=float(o["price"])))
     else:
-        f = pd.read_csv(DATA / "fixtures.csv", encoding="utf-8-sig").query("Div == 'E0'")
+        f = pd.read_csv(DATA / "fixtures.csv", encoding="utf-8-sig").query(f"Div == '{LG['fd']}'")
         for r in f.to_dict("records"):
             for code, name in BOOKS.items():
                 for sel, col in (("H", "H"), ("D", "D"), ("A", "A"), ("O2.5", ">2.5"), ("U2.5", "<2.5")):
@@ -639,9 +682,9 @@ def value_bets(m=None):
 @command
 def value():
     df = value_bets()
-    src = "The Odds API (AU)" if os.environ.get("ODDS_API_KEY") and (DATA / "odds_api.json").exists() else "football-data.co.uk"
+    src = "The Odds API (AU)" if os.environ.get("ODDS_API_KEY") and league_file("odds_api").exists() else "football-data.co.uk"
     w = params()["w"]
-    print(f"Odds: {src}.  Blend = {w:.0%} model + {1 - w:.0%} de-vigged market.  Listing EV > {EV_MIN:.0%}.\n")
+    print(f"{LG['name']}. Odds: {src}.  Blend = {w:.0%} model + {1 - w:.0%} de-vigged market.  Listing EV > {EV_MIN:.0%}.\n")
     bets = df[df.ev > EV_MIN].copy()
     if bets.empty:
         print("No value bets this round. Closest:\n")
@@ -822,13 +865,15 @@ def understat_team(name, slug):
     return keys[close[0]] if len(close) == 1 else None
 
 
-def epl_prop_rows(m):
+def league_prop_rows(m):
+    """Props for the current league's next round; odds are fetched within 2 days of kickoff (books post late)."""
     fx = upcoming()
-    want = set(zip(fx.home, fx.away))
-    for ev in props_events(PROPS_API):
-        if (canon(ev["home_team"]), canon(ev["away_team"])) in want:
-            fetch_event_props(PROPS_API, ev)
-    pl, txg = player_table(), understat_team_xg()
+    api = PROPS_API.replace("soccer_epl", LG["odds"])
+    soon = {(f.home, f.away) for f in fx.itertuples() if f.local.tz_convert(None) <= NOW_UTC + pd.Timedelta(days=2)}
+    for ev in props_events(api) if soon else []:
+        if (canon(ev["home_team"]), canon(ev["away_team"])) in soon:
+            fetch_event_props(api, ev)
+    pl, txg = player_table((LG["understat"],)), understat_team_xg(LG["understat"])
     rows, fair = [], []
     evs = [json.loads(p.read_text()) for p in PROPS_DIR.glob("*.json")]
     for f in fx.itertuples():
@@ -838,7 +883,7 @@ def epl_prop_rows(m):
             continue
         lam, mu = rates(m, f.home, f.away)
         r, fp = price_event(ev, {f.home: player_probs(pl, f.home, lam, txg[f.home]),
-                                 f.away: player_probs(pl, f.away, mu, txg[f.away])}, "EPL")
+                                 f.away: player_probs(pl, f.away, mu, txg[f.away])}, LG["key"])
         rows += r; fair.append(fp)
     return rows, fair
 
@@ -876,11 +921,15 @@ def ucl_prop_rows(em):
     return rows, fair
 
 
-def prop_rows(m=None, em=None):
-    """Every priced prop for the next EPL round and UCL matchday: model chance, best AU price, market median."""
-    m = m or fit(matches(), TODAY + pd.Timedelta(days=1))
+def prop_rows(em=None):
+    """Every priced prop for each league's next round and the UCL matchday: model chance, best AU price, market median."""
     em = em or fit_euro(euro_matches(), TODAY + pd.Timedelta(days=1))
-    rows, fair = epl_prop_rows(m)
+    rows, fair = [], []
+    for k in LEAGUES:
+        set_league(k)
+        r1, f1 = league_prop_rows(fit(matches(), TODAY + pd.Timedelta(days=1)))
+        rows, fair = rows + r1, fair + f1
+    set_league("EPL")
     r2, f2 = ucl_prop_rows(em)
     rows, fair = rows + r2, fair + f2
     if fair:  # model prices for everyone, incl. assists, which no AU book offers
@@ -944,13 +993,21 @@ def settle_ucl(ledger):
 
 
 def settle(ledger):
-    """Grade EPL paper bets from the change in each player's Understat season totals across the match,
+    """Grade league paper bets from the change in each player's Understat season totals across the match,
     UCL ones from ESPN's box score."""
-    pl = pd.DataFrame(load_understat(CURRENT)["players"]).set_index("id")
-    us = understat_matches([CURRENT])
     ledger["result"] = ledger.result.astype(object)
     ledger = settle_ucl(ledger)
-    for i, r in ledger[ledger.result.isna() & (ledger.comp == "EPL")].iterrows():
+    for k in LEAGUES:
+        set_league(k)
+        ledger = settle_league(ledger)
+    set_league("EPL")
+    return ledger
+
+
+def settle_league(ledger):
+    pl = pd.DataFrame(load_understat(CURRENT, LG["understat"])["players"]).set_index("id")
+    us = understat_matches([CURRENT])
+    for i, r in ledger[ledger.result.isna() & (ledger.comp == LG["key"])].iterrows():
         logged, ko = pd.Timestamp(r.logged), pd.Timestamp(r.kickoff)
         fx = us[(us.home == r.home) & (us.away == r.away) & (us.kickoff.dt.date == ko.date())]
         if fx.empty or not fx.played.iat[0]:
@@ -1013,7 +1070,7 @@ def props():
                             "market": pk.market_imp.map(lambda v: "" if pd.isna(v) else f"{v:.1%}"),
                             "ev": pk.ev.map("{:+.1%}".format)})
         print(out.to_string(index=False))
-    print(f"\nlogged {n_new} new paper bets; EPL {ledger_summary(led, 'EPL')}; UCL {ledger_summary(led, 'UCL')}")
+    print(f"\nlogged {n_new} new paper bets; " + "; ".join(f"{c} {ledger_summary(led, c)}" for c in [*LEAGUES, "UCL"]))
     print("Chances assume the player appears (non-runners are void). Check lineups: a benched starter halves these.")
     return df
 
@@ -1387,14 +1444,14 @@ def walk_forward(df, e0, xi, alpha):
 @command
 def backtest(seasons=range(2019, CURRENT)):
     df = matches(2014)
-    e0 = df[(df["div"] == "E0") & df.season.isin(seasons)].reset_index(drop=True)
+    e0 = df[(df["div"] == LG["fd"]) & df.season.isin(seasons)].reset_index(drop=True)
     e0["week"] = e0.date - pd.to_timedelta(e0.date.dt.weekday, unit="D")
     open_mkt = fair3(e0, ["PSH", "PSD", "PSA"])
     close_mkt = fair3(e0, ["PSCH", "PSCD", "PSCA"])
     e0 = e0[np.isfinite(open_mkt).all(1) & np.isfinite(close_mkt).all(1)].reset_index(drop=True)  # few lack Pinnacle odds
     open_mkt, close_mkt = fair3(e0, ["PSH", "PSD", "PSA"]), fair3(e0, ["PSCH", "PSCD", "PSCA"])
     y = e0.FTR.map({"H": 0, "D": 1, "A": 2}).to_numpy()
-    print(f"{len(e0)} EPL matches, seasons {seasons[0]}/{seasons[0] % 100 + 1:02d} to {seasons[-1]}/{seasons[-1] % 100 + 1:02d}\n")
+    print(f"{len(e0)} {LG['name']} matches, seasons {seasons[0]}/{seasons[0] % 100 + 1:02d} to {seasons[-1]}/{seasons[-1] % 100 + 1:02d}\n")
 
     grid = {}
     for xi in (0.003, 0.0045, 0.006):
@@ -1416,7 +1473,7 @@ def backtest(seasons=range(2019, CURRENT)):
         summary["accuracy"].append([name, logloss(Q, y), brier(Q, y)])
 
     # promoted sides: are they systematically mis-rated?
-    prev_e0 = {s: set(df[(df["div"] == "E0") & (df.season == s - 1)].home) for s in seasons}
+    prev_e0 = {s: set(df[(df["div"] == LG["fd"]) & (df.season == s - 1)].home) for s in seasons}
     for side, col in (("home", 0), ("away", 2)):
         mask = np.array([t not in prev_e0[s] for t, s in zip(e0[side], e0.season)])
         print(f"promoted {side} sides ({mask.sum()} games): win prob model {P[mask, col].mean():.3f}, "
@@ -1435,9 +1492,9 @@ def backtest(seasons=range(2019, CURRENT)):
             summary["bets"].append([name, book, int(bet.sum()), profit.mean(), clv.mean()])
     print("\nROI on a few hundred bets is noisy (±5-10%, far more on longshots). CLV = expected return valued at")
     print("Pinnacle's de-vigged closing price: the sturdier test of whether an edge is real.")
-    (DATA / "params.json").write_text(json.dumps(summary["params"]))
-    (DATA / "backtest.json").write_text(json.dumps(summary))
-    print("saved data/params.json and data/backtest.json")
+    league_file("params").write_text(json.dumps(summary["params"]))
+    league_file("backtest").write_text(json.dumps(summary))
+    print(f"saved {league_file('params').name} and {league_file('backtest').name}")
 
 
 # ---------------------------------------------------------------- report
@@ -1476,13 +1533,14 @@ tr:last-child td{border-bottom:0}
 .chart h3{font-size:14px;margin:0 0 8px;font-weight:600}.chart .box{position:relative;height:240px}
 details summary{cursor:pointer;color:var(--ink2);margin-top:12px}
 .empty{color:var(--ink2)}
-.tabs{display:flex;gap:4px;margin:20px 0 4px;border-bottom:1px solid var(--axis)}
-.tabs button{font:600 15px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink2);background:none;border:0;
+.tabs{display:flex;gap:4px;margin:20px 0 4px;border-bottom:1px solid var(--axis);overflow-x:auto;scrollbar-width:none}
+.tabs button{flex:none;white-space:nowrap;font:600 15px/1.2 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--ink2);background:none;border:0;
 border-bottom:2px solid transparent;margin-bottom:-1px;padding:10px 14px;cursor:pointer;border-radius:8px 8px 0 0}
 .tabs button:hover{color:var(--ink);background:var(--surface)}
 .tabs button[aria-selected="true"]{color:var(--ink);border-bottom-color:var(--s1)}
 .tabs button:focus-visible{outline:2px solid var(--s1);outline-offset:2px}
 section[role="tabpanel"] > h2:first-of-type{margin-top:24px}
+@media (max-width:420px){.tabs{gap:0}.tabs button{padding:10px 9px;font-size:14px}}
 """
 
 REPORT_JS = """
@@ -1506,6 +1564,7 @@ tabs.forEach((t, i) => {
 let start = 't-' + location.hash.slice(1);
 if (!document.getElementById(start)) { try { start = localStorage.getItem('tab'); } catch (e) { start = null; } }
 if (start && document.getElementById(start)) show(start);
+addEventListener('hashchange', () => { const t = document.getElementById('t-' + location.hash.slice(1)); if (t) show(t.id); });
 const T = JSON.parse(document.getElementById('trend-data').textContent);
 const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
 const crosshair = {id: 'crosshair', afterDatasetsDraw(c) {
@@ -1590,25 +1649,26 @@ def props_section(comp):
     return out
 
 
-@command
-def report():
+def league_tab():
+    """Inner HTML of the current league's tab: next round, value bets, props, season sim, profiles, backtest."""
     import html
     m = fit(matches(), TODAY + pd.Timedelta(days=1))
     p = params()
-    src = "The Odds API (AU bookmakers)" if os.environ.get("ODDS_API_KEY") and (DATA / "odds_api.json").exists() \
-        else "football-data.co.uk"
-
     pr = predictions(m)
     prof = team_profiles()
-    fx = pd.DataFrame({
-        "Kickoff": pr.kickoff.dt.strftime("%a %d %b %H:%M"), "Match": pr.home + " v " + pr.away,
-        "xG": pr.xg_h.map("{:.2f}".format) + "–" + pr.xg_a.map("{:.2f}".format),
-        "Model H/D/A": [f"{pct(a)} / {pct(b)} / {pct(c)}" for a, b, c in zip(pr.H, pr.D, pr.A)],
-        "Market H/D/A": [f"{pct(a)} / {pct(b)} / {pct(c)}" if pd.notna(a) else "–" for a, b, c in zip(pr.mkt_H, pr.mkt_D, pr.mkt_A)],
-        "Over 2.5 model / market": [f"{pct(a)} / {pct(b) or '–'}" for a, b in zip(pr["O2.5"], pr["mkt_O2.5"])],
-        "BTTS": pr.BTTS.map(pct),
-        "Likely scores": [", ".join(f"{s} {q:.0%}" for s, q in sc[:3]) for sc in pr.scores],
-        "Styles": [" | ".join(f"{t}: {prof['style'].get(t) or '–'}" for t in (h, a)) for h, a in zip(pr.home, pr.away)]})
+    if pr.empty:
+        fx_html = '<p class="empty">No fixtures in the next few days.</p>'
+    else:
+        fx = pd.DataFrame({
+            "Kickoff": pr.kickoff.dt.strftime("%a %d %b %H:%M"), "Match": pr.home + " v " + pr.away,
+            "xG": pr.xg_h.map("{:.2f}".format) + "–" + pr.xg_a.map("{:.2f}".format),
+            "Model H/D/A": [f"{pct(a)} / {pct(b)} / {pct(c)}" for a, b, c in zip(pr.H, pr.D, pr.A)],
+            "Market H/D/A": [f"{pct(a)} / {pct(b)} / {pct(c)}" if pd.notna(a) else "–" for a, b, c in zip(pr.mkt_H, pr.mkt_D, pr.mkt_A)],
+            "Over 2.5 model / market": [f"{pct(a)} / {pct(b) or '–'}" for a, b in zip(pr["O2.5"], pr["mkt_O2.5"])],
+            "BTTS": pr.BTTS.map(pct),
+            "Likely scores": [", ".join(f"{s} {q:.0%}" for s, q in sc[:3]) for sc in pr.scores],
+            "Styles": [" | ".join(f"{t}: {prof['style'].get(t) or '–'}" for t in (h, a)) for h, a in zip(pr.home, pr.away)]})
+        fx_html = f'<div class="card">{html_table(fx, wrap=("Styles",))}</div>'
 
     vb = value_bets(m)
     bets = vb[vb.ev > EV_MIN]
@@ -1618,8 +1678,105 @@ def report():
                          "Model": bets.model.map(pct), "Market": bets.market.map(pct), "Blend": bets.blend.map("{:.1%}".format),
                          "EV": bets.ev.map("{:+.1%}".format), "Soft line": bets.soft_line.map({True: "yes", False: ""}),
                          "Stake": bets.stake.map("{:.1%}".format)})
+    if not len(vb):
+        vb_note = '<p class="empty">No prices yet for the next round.</p>'
 
-    props_html = {c: props_section(c) for c in ("EPL", "UCL")}
+    ss = simulate_season(m)
+    ss = pd.DataFrame({"Team": ss.team, "Points now": ss.pts_now.astype(int), "Expected points": ss.exp_pts.round(1),
+                       "Avg finish": ss.avg_pos.round(1), "Title": ss.title.map(pct), "Top 4": ss.top4.map(pct),
+                       "Top 5": ss.top5.map(pct), "Relegated": ss.relegated.map(pct)})
+    tp = prof.reset_index()
+    tp = pd.DataFrame({"Team": tp.team, "MP": tp.mp, "Pts": tp.pts, "xPts": tp.xpts.round(1),
+                       "xG/g": tp.xg.round(2), "xGA/g": tp.xga.round(2), "PPDA": tp.ppda.round(1),
+                       "Opp PPDA": tp.opp_ppda.round(1), "Deep/g": tp.deep.round(1),
+                       "G − xG": tp.g_minus_xg.round(1), "GA − xGA": tp.ga_minus_xga.round(1),
+                       "Shots/g": tp.shots.round(1), "Shots ag/g": tp.shots_ag.round(1), "Style": tp["style"]})
+
+    bf = league_file("backtest")
+    if bf.exists():
+        bt = json.loads(bf.read_text())
+        acc = pd.DataFrame(bt["accuracy"], columns=["Predictor", "Log loss", "Brier"]).round(4)
+        bs = pd.DataFrame(bt["bets"], columns=["Strategy", "Prices", "Bets", "ROI", "CLV"])
+        bs["ROI"], bs["CLV"] = bs.ROI.map("{:+.1%}".format), bs.CLV.map("{:+.1%}".format)
+        bt_html = (f'<p class="sub">Walk-forward over {bt["matches"]:,} {LG["name"]} matches ({html.escape(bt["seasons"])}), '
+                   f'refitting weekly on data available at the time. Lower log loss and Brier are better.</p>'
+                   f'<div class="card">{html_table(acc)}</div><div class="card">{html_table(bs)}</div>'
+                   '<p class="note">CLV = expected return of each bet valued at Pinnacle\'s de-vigged closing price, the sturdier '
+                   'test of a real edge; ROI on a few hundred bets swings ±5–10% on luck alone. "Max" is the best price across '
+                   'all bookmakers football-data tracks, so it flatters what one account can get.</p>')
+    else:
+        bt_html = f'<p class="empty">Run <code>uv run epl.py --league {LG["key"].lower()} backtest</code> to fill this section.</p>'
+
+    src = "The Odds API (AU bookmakers)" if os.environ.get("ODDS_API_KEY") and league_file("odds_api").exists() \
+        else "football-data.co.uk"
+    w_note = (f"blended {p['w']:.0%} model / {1 - p['w']:.0%} market for value bets" if p["w"] else
+              "the backtest gave the model no weight against Pinnacle, so value bets here are pure line shopping "
+              "(a book's price against the de-vigged sharp price)")
+    return f"""<p class="sub">Dixon–Coles, time decay ξ={p['xi']}, xG weight {1 - p['alpha']:.0%}; {w_note}. Odds from
+{html.escape(src)}.</p>
+
+<h2>Next round</h2>
+<p class="sub">Model probabilities against the de-vigged market. Kickoffs in local time.</p>
+{fx_html}
+
+<h2>Value bets</h2>
+<p class="sub">Best available price where the blended probability gives EV above {EV_MIN:.0%}. Stake = quarter-Kelly, % of bankroll,
+capped at {MAX_STAKE:.0%}. "Soft line" = the price beats the sharp market's fair price on its own.</p>
+<div class="card">{vb_note}{html_table(bets) if len(bets) else ""}</div>
+<p class="note">A big model-vs-market gap usually means team news the model can't see. Check lineups first.</p>
+
+<h2>Player props (paper bets)</h2>
+{PROPS_BLURB.format(extra="")}
+{props_section(LG["key"])}
+<p class="note">Chances assume the player appears (books void non-runners). A benched starter roughly halves them: check lineups.</p>
+
+<h2>Season simulation</h2>
+<p class="sub">10,000 simulations of the remaining fixtures from current ratings.</p>
+<div class="card">{html_table(ss)}</div>
+
+<h2>Team profiles, {CURRENT}/{(CURRENT + 1) % 100:02d}</h2>
+<p class="sub">PPDA = opponent passes per defensive action (lower = more pressing). Opp PPDA = the same, faced in build-up.
+Deep = completed passes within 20 m of goal. G − xG above 0 = scoring above chance quality (tends to regress).</p>
+<div class="card">{html_table(tp, wrap=("Style",))}</div>
+
+<h2>Backtest</h2>
+{bt_html}
+"""
+
+
+PROPS_BLURB = """<p class="sub">Anytime scorer, assists and shots from each player's shrunk xG, xA and shots per 90{extra}, scaled
+to this match's expected goals. Picks need EV above """ + f"{PROPS_EV_MIN:.0%} at the best AU price, odds up to {PROPS_MAX_ODDS}, " \
+    f"and the model no more than {PROPS_MAX_GAP}× the market's chance." + """ Logged, not staked, until the record says
+otherwise. Market = median implied chance across AU books, margin included.</p>"""
+
+
+def trends_html():
+    import html
+    tr = season_trends()
+    data = {c: [None if pd.isna(v) else round(float(v), 3) for v in tr[c]] for _, _, ser in TREND_CHARTS for _, c in ser}
+    trend_json = json.dumps({"seasons": list(tr.index), "charts": TREND_CHARTS, "data": data}).replace("</", "<\\/")
+    dec = tr.groupby([f"{s[:3]}0s" for s in tr.index]).mean()
+    keep = {"goals": "Goals/g", "home_win": "Home win %", "draw": "Draw %", "away_win": "Away win %", "home_gd": "Home GD/g",
+            "over25": "Over 2.5 %", "btts": "BTTS %", "shots": "Shots/g", "fouls": "Fouls/g", "yellows": "Yellows/g",
+            "margin": "B365 margin %", "xg": "xG/g", "ppda": "PPDA"}
+    dec = dec[list(keep)].rename(columns=keep).round(2).reset_index(names="Decade").fillna("–")
+    full = tr.round(2).reset_index(names="Season").fillna("–")
+    charts = "".join(f'<div class="card chart"><h3>{html.escape(t)}</h3><div class="box"><canvas id="c{i}" role="img" '
+                     f'aria-label="{html.escape(t)}, by season. Values are in the season table below."></canvas></div></div>'
+                     for i, (t, _, _) in enumerate(TREND_CHARTS))
+    return f"""
+<h2>How the Premier League has changed</h2>
+<p class="sub">Season averages since 1993/94. Shots and fouls from 2000/01, xG and PPDA from 2014/15 (Understat).</p>
+<div class="charts">{charts}</div>
+<div class="card">{html_table(dec)}</div>
+<details><summary>Every season, every measure</summary><div class="card">{html_table(full)}</div></details>
+<p class="note">Shots on target roughly halve in 2013/14 when football-data changed data provider, so conversion rates before
+and after are not comparable. The current season is partial.</p>
+""", trend_json
+
+
+def ucl_tab():
+    import html
     upr, uvb = ucl_predictions()
     if upr.empty:
         ucl_html = '<p class="empty">No Champions League fixtures scheduled.</p>'
@@ -1648,122 +1805,56 @@ def report():
         eb = json.loads((DATA / "euro_backtest.json").read_text())
         et = pd.DataFrame(eb["rows"], columns=["Model", "Log loss, all European", "Brier, all European", "Log loss, UCL"]).round(4)
         ucl_bt = (f'<p class="sub">Walk-forward over {eb["games"]:,} European games ({eb["ucl_games"]:,} in the UCL proper) '
-                     f'since {html.escape(eb["from"])}, refitting every two weeks. Lower is better. In use: {html.escape(eb["best"])}.</p>'
-                     f'<div class="card">{html_table(et)}</div>')
-    ss = simulate_season(m)
-    ss = pd.DataFrame({"Team": ss.team, "Points now": ss.pts_now.astype(int), "Expected points": ss.exp_pts.round(1),
-                       "Avg finish": ss.avg_pos.round(1), "Title": ss.title.map(pct), "Top 4": ss.top4.map(pct),
-                       "Top 5": ss.top5.map(pct), "Relegated": ss.relegated.map(pct)})
-
-    tp = prof.reset_index()
-    tp = pd.DataFrame({"Team": tp.team, "MP": tp.mp, "Pts": tp.pts, "xPts": tp.xpts.round(1),
-                       "xG/g": tp.xg.round(2), "xGA/g": tp.xga.round(2), "PPDA": tp.ppda.round(1),
-                       "Opp PPDA": tp.opp_ppda.round(1), "Deep/g": tp.deep.round(1),
-                       "G − xG": tp.g_minus_xg.round(1), "GA − xGA": tp.ga_minus_xga.round(1),
-                       "Shots/g": tp.shots.round(1), "Shots ag/g": tp.shots_ag.round(1), "Style": tp["style"]})
-
-    tr = season_trends()
-    data = {c: [None if pd.isna(v) else round(float(v), 3) for v in tr[c]] for _, _, ser in TREND_CHARTS for _, c in ser}
-    trend_json = json.dumps({"seasons": list(tr.index), "charts": TREND_CHARTS, "data": data}).replace("</", "<\\/")
-    dec = tr.groupby([f"{s[:3]}0s" for s in tr.index]).mean()
-    keep = {"goals": "Goals/g", "home_win": "Home win %", "draw": "Draw %", "away_win": "Away win %", "home_gd": "Home GD/g",
-            "over25": "Over 2.5 %", "btts": "BTTS %", "shots": "Shots/g", "fouls": "Fouls/g", "yellows": "Yellows/g",
-            "margin": "B365 margin %", "xg": "xG/g", "ppda": "PPDA"}
-    dec = dec[list(keep)].rename(columns=keep).round(2).reset_index(names="Decade").fillna("–")
-    full = tr.round(2).reset_index(names="Season").fillna("–")
-
-    bt = json.loads((DATA / "backtest.json").read_text()) if (DATA / "backtest.json").exists() else None
-    if bt:
-        acc = pd.DataFrame(bt["accuracy"], columns=["Predictor", "Log loss", "Brier"]).round(4)
-        bs = pd.DataFrame(bt["bets"], columns=["Strategy", "Prices", "Bets", "ROI", "CLV"])
-        bs["ROI"], bs["CLV"] = bs.ROI.map("{:+.1%}".format), bs.CLV.map("{:+.1%}".format)
-        bt_html = (f'<p class="sub">Walk-forward over {bt["matches"]:,} EPL matches ({html.escape(bt["seasons"])}), refitting weekly '
-                   f'on data available at the time. Lower log loss and Brier are better.</p>'
-                   f'<div class="card">{html_table(acc)}</div><div class="card">{html_table(bs)}</div>'
-                   '<p class="note">CLV = expected return of each bet valued at Pinnacle\'s de-vigged closing price, the sturdier '
-                   'test of a real edge; ROI on a few hundred bets swings ±5–10% on luck alone. "Max" is the best price across '
-                   'all bookmakers football-data tracks, so it flatters what one account can get.</p>')
-    else:
-        bt_html = '<p class="empty">Run <code>uv run epl.py backtest</code> to fill this section.</p>'
-
-    charts = "".join(f'<div class="card chart"><h3>{html.escape(t)}</h3><div class="box"><canvas id="c{i}" role="img" '
-                     f'aria-label="{html.escape(t)}, by season. Values are in the season table below."></canvas></div></div>'
-                     for i, (t, _, _) in enumerate(TREND_CHARTS))
-    head = f"""<title>Football Predictor</title><meta name="claude:viewport-fit-sides" content="cover">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600&display=swap">
-<style>{REPORT_CSS}</style>"""
-    body = f"""<main>
-<h1>Football Predictor</h1>
-<p class="sub">Generated {datetime.now():%a %d %b %Y %H:%M}. Odds from {html.escape(src)}.</p>
-
-<div class="tabs" role="tablist" aria-label="Competition">
-<button role="tab" id="t-epl" aria-controls="p-epl" aria-selected="true">Premier League</button>
-<button role="tab" id="t-ucl" aria-controls="p-ucl" aria-selected="false" tabindex="-1">Champions League</button>
-</div>
-
-<section role="tabpanel" id="p-epl" aria-labelledby="t-epl">
-<p class="sub">Dixon–Coles, time decay ξ={p['xi']}, xG weight {1 - p['alpha']:.0%}, blended {p['w']:.0%} model /
-{1 - p['w']:.0%} market for value bets.</p>
-
-<h2>Next round</h2>
-<p class="sub">Model probabilities against the de-vigged market. Kickoffs in local time.</p>
-<div class="card">{html_table(fx, wrap=("Styles",))}</div>
-
-<h2>Value bets</h2>
-<p class="sub">Best available price where the blended probability gives EV above {EV_MIN:.0%}. Stake = quarter-Kelly, % of bankroll,
-capped at {MAX_STAKE:.0%}. "Soft line" = the price beats the sharp market's fair price on its own.</p>
-<div class="card">{vb_note}{html_table(bets)}</div>
-<p class="note">A big model-vs-market gap usually means team news the model can't see. Check lineups first.</p>
-
-<h2>Player props (paper bets)</h2>
-<p class="sub">Anytime scorer, assists and shots from each player's shrunk xG, xA and shots per 90, scaled to this match's
-expected goals. Picks need EV above {PROPS_EV_MIN:.0%} at the best AU price, odds up to {PROPS_MAX_ODDS}, and the model no more
-than {PROPS_MAX_GAP}× the market's chance. Logged, not staked, until the record says otherwise. Market = median implied chance
-across AU books, margin included.</p>
-{props_html["EPL"]}
-<p class="note">Chances assume the player appears (books void non-runners). A benched starter roughly halves them: check lineups.</p>
-
-<h2>Season simulation</h2>
-<p class="sub">10,000 simulations of the remaining fixtures from current ratings.</p>
-<div class="card">{html_table(ss)}</div>
-
-<h2>Team profiles, {CURRENT}/{(CURRENT + 1) % 100:02d}</h2>
-<p class="sub">PPDA = opponent passes per defensive action (lower = more pressing). Opp PPDA = the same, faced in build-up.
-Deep = completed passes within 20 m of goal. G − xG above 0 = scoring above chance quality (tends to regress).</p>
-<div class="card">{html_table(tp, wrap=("Style",))}</div>
-
-<h2>How the Premier League has changed</h2>
-<p class="sub">Season averages since 1993/94. Shots and fouls from 2000/01, xG and PPDA from 2014/15 (Understat).</p>
-<div class="charts">{charts}</div>
-<div class="card">{html_table(dec)}</div>
-<details><summary>Every season, every measure</summary><div class="card">{html_table(full)}</div></details>
-<p class="note">Shots on target roughly halve in 2013/14 when football-data changed data provider, so conversion rates before
-and after are not comparable. The current season is partial.</p>
-
-<h2>Backtest</h2>
-{bt_html}
-</section>
-
-<section role="tabpanel" id="p-ucl" aria-labelledby="t-ucl" hidden>
-<p class="sub">Cross-league Dixon–Coles on goals from {len(DOMESTIC)} domestic leagues plus every European cup and qualifier since
-2019/20 (ESPN). A club's strength is its league's plus its own; European games put the leagues on one scale. Clubs from
-leagues ESPN doesn't carry (Czechia, Ukraine, Croatia, Azerbaijan...) are rated from European games alone. Value bets use the
-same {p['w']:.0%} model / {1 - p['w']:.0%} market blend as the EPL. That blend was tuned on EPL games, not European ones.</p>
+                  f'since {html.escape(eb["from"])}, refitting every two weeks. Lower is better. In use: {html.escape(eb["best"])}.</p>'
+                  f'<div class="card">{html_table(et)}</div>')
+    w = params()["w"]
+    return f"""<p class="sub">Cross-league Dixon–Coles on goals from {len(DOMESTIC)} domestic leagues plus every European cup and
+qualifier since 2019/20 (ESPN). A club's strength is its league's plus its own; European games put the leagues on one scale.
+Clubs from leagues ESPN doesn't carry (Czechia, Ukraine, Croatia, Azerbaijan...) are rated from European games alone. Value
+bets use the same {w:.0%} model / {1 - w:.0%} market blend as the EPL. That blend was tuned on EPL games, not European ones.</p>
 
 <h2>Next matchday</h2>
 {ucl_html}
 
 <h2>Player props (paper bets)</h2>
-<p class="sub">Anytime scorer, assists and shots from each player's shrunk xG, xA and shots per 90 in their domestic league (Understat's five leagues; other clubs' players aren't priced), scaled to this match's
-expected goals. Picks need EV above {PROPS_EV_MIN:.0%} at the best AU price, odds up to {PROPS_MAX_ODDS}, and the model no more
-than {PROPS_MAX_GAP}× the market's chance. Logged, not staked, until the record says otherwise. Market = median implied chance
-across AU books, margin included.</p>
-{props_html["UCL"]}
+{PROPS_BLURB.format(extra=" in their domestic league (Understat's five leagues; other clubs' players aren't priced)")}
+{props_section("UCL")}
 <p class="note">Chances assume the player appears (books void non-runners). A benched starter roughly halves them: check lineups.</p>
 
 <h2>Backtest</h2>
 {ucl_bt}
-</section>
+"""
+
+
+@command
+def report():
+    import html
+    tabs = []
+    for k in LEAGUES:
+        set_league(k)
+        body = league_tab()
+        if k == "EPL":
+            th, trend_json = trends_html()
+            body += th
+        tabs.append((k.lower(), LG["name"], body))
+    set_league("EPL")
+    tabs.append(("ucl", "Champions League", ucl_tab()))
+    buttons = "\n".join(f'<button role="tab" id="t-{k}" aria-controls="p-{k}" aria-selected="{str(i == 0).lower()}"'
+                        f'{"" if i == 0 else " tabindex=\"-1\""}>{html.escape(name)}</button>' for i, (k, name, _) in enumerate(tabs))
+    panels = "\n".join(f'<section role="tabpanel" id="p-{k}" aria-labelledby="t-{k}"{"" if i == 0 else " hidden"}>\n{b}</section>'
+                       for i, (k, _, b) in enumerate(tabs))
+    head = f"""<title>Football Predictor</title><meta name="claude:viewport-fit-sides" content="cover">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600&display=swap">
+<style>{REPORT_CSS}</style>"""
+    body = f"""<main>
+<h1>Football Predictor</h1>
+<p class="sub">Generated {datetime.now():%a %d %b %Y %H:%M}.</p>
+
+<div class="tabs" role="tablist" aria-label="Competition">
+{buttons}
+</div>
+
+{panels}
 </main>
 <script type="application/json" id="trend-data">{trend_json}</script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
@@ -1776,7 +1867,15 @@ across AU books, margin included.</p>
 
 
 if __name__ == "__main__":
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "predict"
+    args = sys.argv[1:]
+    if "--league" in args:  # e.g. uv run epl.py --league laliga predict
+        i = args.index("--league")
+        want = {k.lower(): k for k in LEAGUES}.get(args[i + 1].lower()) if i + 1 < len(args) else None
+        if want is None:
+            sys.exit(f"--league takes one of: {', '.join(LEAGUES)}")
+        set_league(want)
+        del args[i:i + 2]
+    cmd = args[0] if args else "predict"
     if cmd not in COMMANDS:
         sys.exit(__doc__)
     COMMANDS[cmd]()
