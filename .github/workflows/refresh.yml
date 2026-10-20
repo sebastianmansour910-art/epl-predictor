@@ -29,6 +29,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
+      - name: Check the Odds API key arrived
+        run: |
+          if [ -n "$ODDS_API_KEY" ]; then echo "::notice::ODDS_API_KEY is set (${#ODDS_API_KEY} characters)"
+          else echo "::warning::ODDS_API_KEY is empty: add it under Settings > Secrets and variables > Actions > Repository secrets"; fi
       - name: Fetch and rebuild
         run: |
           uv run epl.py fetch
