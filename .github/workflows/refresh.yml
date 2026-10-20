@@ -1,0 +1,52 @@
+name: Refresh
+
+on:
+  schedule:
+    - cron: "0 10,21 * * *"  # 9 pm and 8 am Sydney (AEDT); an hour earlier in winter. GitHub may start late.
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: [epl.py, .github/workflows/refresh.yml]
+
+permissions:
+  contents: write  # commit the refreshed data back (props ledger, ESPN cache)
+  pages: write
+  id-token: write
+
+concurrency:
+  group: refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      TZ: Australia/Sydney  # kickoff times and "today" in local time
+      ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Fetch and rebuild
+        run: |
+          uv run epl.py fetch
+          uv run epl.py value
+          uv run epl.py props
+          uv run epl.py ucl
+          uv run epl.py report
+      - name: Commit data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data
+          git diff --cached --quiet || git commit -q -m "Refresh data $(date '+%Y-%m-%d %H:%M')"
+          git pull -q --rebase && git push -q
+      - run: mkdir _site && cp report.html _site/index.html
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - id: deploy
+        uses: actions/deploy-pages@v4
