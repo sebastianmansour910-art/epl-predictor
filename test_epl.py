@@ -121,4 +121,17 @@ try:
         assert len(calls) == 1
 finally:
     urllib.request.urlopen, time.sleep = real_open, real_sleep
+
+# Understat's maintenance page is never cached as data
+assert not epl.is_understat_data(b"<!DOCTYPE html><html><title>Understat.com</title>We will come back soon</html>")
+assert epl.is_understat_data(b'{"teams": {}, "players": [], "dates": []}')
+
+# games Understat hasn't posted are filled from football-data (results and xG); posted ones are left alone
+(d / f"E0_{epl.CURRENT}.csv").write_text("Div,Date,HomeTeam,AwayTeam,FTHG,FTAG,HxG,AxG\n"
+                                         "E0,01/11/2026,Arsenal,Chelsea,2,1,1.8,0.6\nE0,02/11/2026,Chelsea,Arsenal,0,0,0.9,1.1\n")
+us = pd.DataFrame(dict(season=epl.CURRENT, home=["Arsenal", "Chelsea"], away=["Chelsea", "Arsenal"], played=[False, True],
+                       kickoff=pd.to_datetime(["2026-11-01 15:00", "2026-11-02 15:00"]), hg=[np.nan, 3.0], ag=[np.nan, 3.0],
+                       xg_h=[np.nan, 2.0], xg_a=[np.nan, 2.0]))
+f = epl.fill_results(us)
+assert f.played.all() and f.hg.tolist() == [2, 3] and f.xg_a.tolist() == [0.6, 2.0], f
 print("ok")

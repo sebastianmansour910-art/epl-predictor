@@ -120,6 +120,20 @@ def get(url, headers=None):
     return fetch_url(url, headers)[0]
 
 
+def is_understat_data(body):
+    """Understat answers with a "We will come back soon" page when it is down (all of Nov 2026); never cache that."""
+    try:
+        return "dates" in json.loads(body)
+    except ValueError:
+        return False
+
+
+def warn(msg):
+    print(msg)
+    if os.environ.get("GITHUB_ACTIONS"):
+        print(f"::warning::{msg}")  # shows on the workflow run's summary page
+
+
 # ---------------------------------------------------------------- data
 
 def fetch():
@@ -132,16 +146,25 @@ def fetch():
     jobs += [(understat_path(lg, y), UNDERSTAT.replace("EPL", lg).format(y=y), {"X-Requested-With": "XMLHttpRequest"})
              for lg in UNDERSTAT_LEAGUES for y in (range(2014, CURRENT + 1) if lg in full else (CURRENT - 1, CURRENT))]
     jobs += [(DATA / "fixtures.csv", FIXTURES, None)]
+    down = []  # Understat files it answered with a web page instead of data
     for path, url, headers in jobs:
         if path.exists() and not any(str(y) in path.name for y in (CURRENT, CURRENT - 1)) and path.name != "fixtures.csv":
             continue  # older seasons never change (last season is refetched in case it was cached mid-season)
         try:
-            path.write_bytes(get(url, headers))
+            body = get(url, headers)
+            if path.suffix == ".json" and not is_understat_data(body):
+                if not path.exists():
+                    raise RuntimeError(f"Understat sent a web page instead of {path.name} and there is no cached copy")
+                down.append(path.name)
+                continue
+            path.write_bytes(body)
             print("fetched", path.name)
         except (OSError, http.client.HTTPException) as e:
             if not path.exists():
                 raise
             print(f"could not refresh {path.name} ({e!r}); kept the cached copy")
+    if down:
+        warn(f"Understat is unavailable (it sent a web page, not data); kept the cached copies of {len(down)} files")
     for k in LEAGUES:
         set_league(k)
         fetch_league_odds()
@@ -221,6 +244,36 @@ def understat_matches(years):
     return df
 
 
+def fill_results(us):
+    """Games Understat hasn't posted (it can be down for weeks) marked played from football-data's results and xG.
+    For the table and season sim only: props are graded from Understat's player totals, which stay frozen too."""
+    try:
+        fd = load_fd(LG["fd"], sorted(us.season.unique()))
+    except ValueError:  # no football-data file yet (season start)
+        return us
+    cols = ["season", "home", "away", "hg", "ag"] + (["HxG", "AxG"] if "HxG" in fd else [])
+    m = us.merge(fd[cols], on=["season", "home", "away"], how="left", suffixes=("", "_fd"))
+    gap = (~m.played & m.hg_fd.notna()).to_numpy()
+    m.loc[gap, ["hg", "ag"]] = m.loc[gap, ["hg_fd", "ag_fd"]].to_numpy()
+    if "HxG" in m:
+        m.loc[gap, "xg_h"], m.loc[gap, "xg_a"] = pd.to_numeric(m.HxG[gap]), pd.to_numeric(m.AxG[gap])
+    m.loc[gap, "played"] = True
+    return m[us.columns]
+
+
+def understat_note():
+    """A line for the report when Understat's data stops before football-data's results do."""
+    us = understat_matches([CURRENT]).query("played")
+    try:
+        last_fd = load_fd(LG["fd"], [CURRENT]).date.max()
+    except ValueError:
+        return ""
+    if us.empty or last_fd <= us.kickoff.max().normalize() + pd.Timedelta(days=2):
+        return ""
+    return (f"Understat hasn't updated since {us.kickoff.max():%d %b}, so pressing (PPDA), deep completions and "
+            f"xG-luck figures stop there. Results and the season simulation use football-data.co.uk up to {last_fd:%d %b}.")
+
+
 @cache
 def top_teams(y, div, understat):
     teams = set()
@@ -239,6 +292,10 @@ def matches(first=2014):
     unknown = set(us.home) - set(df.home)
     assert not unknown, f"add these Understat names to ALIASES: {unknown}"
     df = df.merge(us[["season", "home", "away", "xg_h", "xg_a"]], on=["season", "home", "away"], how="left")
+    if "HxG" in df:  # football-data's own xG (2026/27 on) covers top-flight games Understat hasn't posted
+        gap = (df["div"] == top) & df.xg_h.isna()
+        df.loc[gap, "xg_h"] = pd.to_numeric(df.HxG[gap], errors="coerce")
+        df.loc[gap, "xg_a"] = pd.to_numeric(df.AxG[gap], errors="coerce")
     # Understat posts results days before football-data does; add the ones football-data lacks.
     new = us.merge(df[["season", "home", "away"]], how="left", indicator=True).query("_merge == 'left_only'")
     new = new.assign(date=new.kickoff.dt.normalize(), div=top, hg=new.hg.astype(int), ag=new.ag.astype(int))
@@ -457,6 +514,8 @@ def tactics():
     print(show.to_string())
     print("\nppda = opponent passes per defensive action (lower = more pressing); opp_ppda = same, faced in build-up")
     print("deep = completed passes within 20m of goal; g_minus_xg > 0 = scoring above chance quality\n")
+    if note := understat_note():
+        print(note + "\n")
     for t, s in df["style"].items():
         print(f"  {t:16s} {s}")
     return df
@@ -542,7 +601,7 @@ def predict():
 
 
 def simulate_season(m, n=10_000, seed=None):
-    us = understat_matches([CURRENT])
+    us = fill_results(understat_matches([CURRENT]))
     teams = sorted(set(us.home))
     ti = {t: i for i, t in enumerate(teams)}
     k = len(teams)
@@ -1737,6 +1796,7 @@ capped at {MAX_STAKE:.0%}. "Soft line" = the price beats the sharp market's fair
 <h2>Team profiles, {CURRENT}/{(CURRENT + 1) % 100:02d}</h2>
 <p class="sub">PPDA = opponent passes per defensive action (lower = more pressing). Opp PPDA = the same, faced in build-up.
 Deep = completed passes within 20 m of goal. G − xG above 0 = scoring above chance quality (tends to regress).</p>
+{f'<p class="note">{html.escape(note)}</p>' if (note := understat_note()) else ''}
 <div class="card">{html_table(tp, wrap=("Style",))}</div>
 
 <h2>Backtest</h2>
